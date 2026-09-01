@@ -578,15 +578,20 @@ impl ArrayToBytesCodecTraits for CodecChain {
                 .partial_decoder(input_handle, shape, data_type, fill_value, options)?
         };
 
-        for (codec, (shape, data_type, fill_value)) in std::iter::zip(
-            self.array_to_array.iter().rev(),
-            array_representations.iter().rev().skip(1),
-        ) {
+        for (codec, ((enc_shape, enc_data_type, _enc_fill), (shape, data_type, fill_value))) in
+            std::iter::zip(
+                self.array_to_array.iter().rev(),
+                std::iter::zip(
+                    array_representations.iter().rev(),
+                    array_representations.iter().rev().skip(1),
+                ),
+            )
+        {
             if Some(codec_index) == self.cache_index {
                 input_handle = Arc::new(ArrayPartialDecoderCache::new(
                     &*input_handle,
-                    shape.clone(),
-                    data_type.clone(),
+                    enc_shape.clone(),
+                    enc_data_type.clone(),
                     options,
                 )?);
             }
@@ -709,16 +714,21 @@ impl ArrayToBytesCodecTraits for CodecChain {
                 .await?
         };
 
-        for (codec, (shape, data_type, fill_value)) in std::iter::zip(
-            self.array_to_array.iter().rev(),
-            array_representations.iter().rev().skip(1),
-        ) {
+        for (codec, ((enc_shape, enc_data_type, _enc_fill), (shape, data_type, fill_value))) in
+            std::iter::zip(
+                self.array_to_array.iter().rev(),
+                std::iter::zip(
+                    array_representations.iter().rev(),
+                    array_representations.iter().rev().skip(1),
+                ),
+            )
+        {
             if Some(codec_index) == self.cache_index {
                 input_handle = Arc::new(
                     ArrayPartialDecoderCache::async_new(
                         &*input_handle,
-                        shape.clone(),
-                        data_type.clone(),
+                        enc_shape.clone(),
+                        enc_data_type.clone(),
                         options,
                     )
                     .await?,
