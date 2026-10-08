@@ -72,30 +72,110 @@ pub(crate) fn inverse_permutation(order: &[usize]) -> Vec<usize> {
     inverse
 }
 
+/// Permute fixed-size elements. `transpose_order` carries a trailing axis for
+/// the element bytes, which must stay last.
+///
+/// Copies whole elements with precomputed strides; viewing the bytes as an
+/// `IxDyn` array and permuting byte by byte is an order of magnitude slower.
 fn transpose_array(
     transpose_order: &[usize],
     untransposed_shape: &[u64],
     bytes_per_element: usize,
     data: &[u8],
 ) -> Result<Vec<u8>, ndarray::ShapeError> {
-    // Create an array view of the data
-    let mut shape_n = Vec::with_capacity(untransposed_shape.len() + 1);
-    for size in untransposed_shape {
-        shape_n.push(usize::try_from(*size).unwrap());
+    let incompatible = || ndarray::ShapeError::from_kind(ndarray::ErrorKind::IncompatibleShape);
+    let ndim = untransposed_shape.len();
+    if transpose_order.len() != ndim + 1 || transpose_order[ndim] != ndim {
+        return Err(incompatible());
     }
-    shape_n.push(bytes_per_element);
-    let array = ndarray::ArrayViewD::<u8>::from_shape(shape_n, data)?;
+    let order = &transpose_order[..ndim];
+    let shape: Vec<usize> = untransposed_shape
+        .iter()
+        .map(|&s| usize::try_from(s).map_err(|_| incompatible()))
+        .collect::<Result<_, _>>()?;
+    let num_elements = shape
+        .iter()
+        .try_fold(1usize, |acc, &s| acc.checked_mul(s))
+        .ok_or_else(incompatible)?;
+    if num_elements.checked_mul(bytes_per_element) != Some(data.len()) {
+        return Err(incompatible());
+    }
+    if num_elements == 0 || order.iter().enumerate().all(|(i, &axis)| i == axis) {
+        return Ok(data.to_vec());
+    }
 
-    // Transpose the data
-    let array_transposed = array.permuted_axes(transpose_order);
-    if array_transposed.is_standard_layout() {
-        Ok(array_transposed.to_owned().into_raw_vec_and_offset().0)
-    } else {
-        Ok(array_transposed
-            .as_standard_layout()
-            .into_owned()
-            .into_raw_vec_and_offset()
-            .0)
+    // Element strides of the input, then the output shape and the input stride
+    // walked by each output axis.
+    let mut in_strides = vec![1usize; ndim];
+    for axis in (0..ndim.saturating_sub(1)).rev() {
+        in_strides[axis] = in_strides[axis + 1] * shape[axis + 1];
+    }
+    let out_shape: Vec<usize> = order.iter().map(|&axis| shape[axis]).collect();
+    let strides: Vec<usize> = order.iter().map(|&axis| in_strides[axis]).collect();
+
+    let mut out = vec![0u8; data.len()];
+    match bytes_per_element {
+        1 => permute_elements::<1>(data, &mut out, &out_shape, &strides),
+        2 => permute_elements::<2>(data, &mut out, &out_shape, &strides),
+        4 => permute_elements::<4>(data, &mut out, &out_shape, &strides),
+        8 => permute_elements::<8>(data, &mut out, &out_shape, &strides),
+        16 => permute_elements::<16>(data, &mut out, &out_shape, &strides),
+        n => permute_elements_dyn(data, &mut out, &out_shape, &strides, n),
+    }
+    Ok(out)
+}
+
+/// Fill `out` in row-major output order. The innermost output axis is copied
+/// in a tight strided loop; an odometer advances the outer axes.
+fn permute_elements<const N: usize>(
+    data: &[u8],
+    out: &mut [u8],
+    out_shape: &[usize],
+    strides: &[usize],
+) {
+    let (inner_len, outer_shape) = out_shape.split_last().expect("ndim >= 1");
+    let (inner_stride, outer_strides) = strides.split_last().expect("ndim >= 1");
+    let mut index = vec![0usize; outer_shape.len()];
+    let mut base = 0usize;
+    for row in out.chunks_exact_mut(inner_len * N) {
+        for (j, dst) in row.chunks_exact_mut(N).enumerate() {
+            let src = (base + j * inner_stride) * N;
+            dst.copy_from_slice(&data[src..src + N]);
+        }
+        advance(&mut index, &mut base, outer_shape, outer_strides);
+    }
+}
+
+fn permute_elements_dyn(
+    data: &[u8],
+    out: &mut [u8],
+    out_shape: &[usize],
+    strides: &[usize],
+    n: usize,
+) {
+    let (inner_len, outer_shape) = out_shape.split_last().expect("ndim >= 1");
+    let (inner_stride, outer_strides) = strides.split_last().expect("ndim >= 1");
+    let mut index = vec![0usize; outer_shape.len()];
+    let mut base = 0usize;
+    for row in out.chunks_exact_mut(inner_len * n) {
+        for (j, dst) in row.chunks_exact_mut(n).enumerate() {
+            let src = (base + j * inner_stride) * n;
+            dst.copy_from_slice(&data[src..src + n]);
+        }
+        advance(&mut index, &mut base, outer_shape, outer_strides);
+    }
+}
+
+/// Increment a row-major multi-index, keeping `base` at its input offset.
+fn advance(index: &mut [usize], base: &mut usize, shape: &[usize], strides: &[usize]) {
+    for axis in (0..index.len()).rev() {
+        index[axis] += 1;
+        *base += strides[axis];
+        if index[axis] < shape[axis] {
+            return;
+        }
+        *base -= strides[axis] * index[axis];
+        index[axis] = 0;
     }
 }
 
@@ -277,6 +357,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes, decoded);
+    }
+
+    /// The original byte-wise `ndarray` permutation, kept as the reference.
+    fn transpose_array_reference(
+        transpose_order: &[usize],
+        untransposed_shape: &[u64],
+        bytes_per_element: usize,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut shape_n: Vec<usize> = untransposed_shape
+            .iter()
+            .map(|s| usize::try_from(*s).unwrap())
+            .collect();
+        shape_n.push(bytes_per_element);
+        ndarray::ArrayViewD::<u8>::from_shape(shape_n, data)
+            .unwrap()
+            .permuted_axes(transpose_order)
+            .as_standard_layout()
+            .into_owned()
+            .into_raw_vec_and_offset()
+            .0
+    }
+
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![vec![]];
+        }
+        let mut out = Vec::new();
+        for rest in permutations(n - 1) {
+            for i in 0..=rest.len() {
+                let mut p = rest.clone();
+                p.insert(i, n - 1);
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn transpose_array_matches_ndarray_reference() {
+        let shapes: [&[u64]; 7] = [
+            &[5],
+            &[3, 4],
+            &[8, 37],
+            &[2, 3, 4],
+            &[2, 1, 3, 2],
+            &[0, 3],
+            &[1, 1],
+        ];
+        for shape in shapes {
+            for order in permutations(shape.len()) {
+                for bytes_per_element in [1, 2, 3, 4, 8, 16] {
+                    let len = shape.iter().product::<u64>() as usize * bytes_per_element;
+                    let data: Vec<u8> = (0..len).map(|i| (i * 7 + i / 251) as u8).collect();
+                    let mut order_with_bytes = order.clone();
+                    order_with_bytes.push(order.len());
+                    assert_eq!(
+                        transpose_array(&order_with_bytes, shape, bytes_per_element, &data)
+                            .unwrap(),
+                        transpose_array_reference(
+                            &order_with_bytes,
+                            shape,
+                            bytes_per_element,
+                            &data
+                        ),
+                        "shape {shape:?} order {order:?} bytes_per_element {bytes_per_element}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transpose_array_rejects_mismatched_length() {
+        assert!(transpose_array(&[1, 0, 2], &[2, 3], 4, &[0u8; 23]).is_err());
     }
 
     #[test]
